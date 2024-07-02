@@ -1,0 +1,1 @@
+Remember to add -pthread to the gcc command in the main makefile
