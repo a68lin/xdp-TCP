@@ -57,10 +57,11 @@ struct flow_id fid;
 
 struct tcp_md tcp_ctx = {
 	.segment_size = 1,
-	.current_size = 0,
-	.initial_seq = 0,
+	.window_size = 10,
 	.window_start_seq = 0,
 	.last_seq_sent = -1,
+	.cur_size = 0,
+	.head = 0,
 };
 
 struct Argument {

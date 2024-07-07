@@ -54,22 +54,65 @@ struct
 struct
 {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 32);
+    __uint(max_entries, WINDOW_SIZE);
     __type(key, __u32);
     __type(value, struct packet_event);
-} packet_events SEC(".maps");
+} window_packets SEC(".maps");
 
-static __always_inline int parse_ethhdr_new(struct hdr_cursor *nh,
-					void *data_end,
-					struct ethhdr **ethhdr)
-{
-	struct ethhdr *eth = nh->pos;
-	int hdrsize = sizeof(*eth);
-	if (nh->pos + hdrsize > data_end)
-		return -1;
-	nh->pos += hdrsize;
-	*ethhdr = eth;
-	return eth->h_proto; /* network-byte-order */
+static __always_inline int enque(struct packet_event *p, struct flow_id *fid) {
+    struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, fid);
+    if(!tcp_ctx) {
+        bpf_printk("\ntcp_ctx does not exist with the fid");
+        return 0;
+    }
+    // Check if the window is full
+    if(tcp_ctx->cur_size == tcp_ctx->window_size) {
+        bpf_printk("The window is full, the packet cannot be added");
+        return 0;
+    }
+    // Add the packet
+    __u32 key = (tcp_ctx->head + tcp_ctx->cur_size) % tcp_ctx->window_size;
+    bpf_map_update_elem(&window_packets, &key, p, BPF_ANY);
+    tcp_ctx->cur_size += 1;
+    bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
+    return 1;
+}
+
+static __always_inline int deque(struct flow_id *fid) {
+    struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, fid);
+    if(!tcp_ctx) {
+        bpf_printk("\ntcp_ctx does not exist with the fid");
+        return 0;
+    }
+    // Check if the window is empty
+    if(tcp_ctx->cur_size == 0) {
+        bpf_printk("The window is empty, no packet can be removed");
+        return 0;
+    }
+    // Remove the packet
+    tcp_ctx->head = (tcp_ctx->head + 1) % tcp_ctx->window_size;
+    tcp_ctx->cur_size -= 1;
+    bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
+    return 1;
+}
+
+static __always_inline void display(struct flow_id *fid) {
+    struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, fid);
+    if(!tcp_ctx) {
+        bpf_printk("\ntcp_ctx does not exist with the fid");
+        return;
+    }
+    bpf_printk("\nPackets in the window:");
+    for(int i = 0; i < WINDOW_SIZE; i++) {
+        if(i + 1 > tcp_ctx->cur_size) return;
+        __u32 key = (tcp_ctx->head + i) % tcp_ctx->window_size;
+        struct packet_event *pe = bpf_map_lookup_elem(&window_packets, &key);
+        if(!pe) {
+            bpf_printk("The packet does not exist");
+            return;
+        }
+        bpf_printk("Seq num: %u", pe->seq_num);
+    }
 }
 
 static __always_inline void app_event_processor(struct app_event* ae) {
@@ -79,32 +122,15 @@ static __always_inline void app_event_processor(struct app_event* ae) {
         bpf_printk("\ntcp_ctx does not exist with the fid\n");
         return;
     }
-    // bpf_printk("Packet data_size: %u", ae->data_end - ae->data);
-    // if(ae->data_end - ae->data >= 1) {
-    //     char * message = (char *)(ae->data);
-    //     pe.data = *(message);
-    //     bpf_printk("Packet data: %c", pe.data);
-    // }
     for (int i = 0; i < WINDOW_SIZE; i++) {
         struct packet_event pe;
         __builtin_memset(&pe, 0, sizeof(pe));
         pe.fid = ae->fid;
         pe.size =tcp_ctx->segment_size;
         pe.seq_num = tcp_ctx->last_seq_sent + 1;
-        int ret = bpf_map_update_elem(&packet_events, &pe.seq_num, &pe, BPF_ANY);
-        if (ret < 0) {
-            bpf_printk("\nFailed to add packet with seq_num %u", 0);
-        }
-        tcp_ctx->current_size += 1;
+        enque(&pe, &(ae->fid));
         tcp_ctx->last_seq_sent += 1;
         bpf_map_update_elem(&tcp_connections, &(ae->fid), tcp_ctx, BPF_ANY);
-
-        tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &ae->fid);
-        if(!tcp_ctx) {
-            bpf_printk("\ntcp_ctx does not exist with the fid");
-            return;
-        }
-        bpf_printk("\nSend packet with seq_num: %u, window_size: %u, last_seq_sent: %u", pe.seq_num, tcp_ctx->current_size, tcp_ctx->last_seq_sent);
     }
 }
 
@@ -123,51 +149,41 @@ static __always_inline void net_event_processor(struct net_event* ne) {
         bpf_printk("\ntcp_ctx does not exist with the fid\n");
         return;
     }
-    int current_start = tcp_ctx->window_start_seq;
-    if(ne->ack > tcp_ctx->window_start_seq) {
-        tcp_ctx->current_size = tcp_ctx->current_size - (ne->ack - tcp_ctx->window_start_seq);
-        tcp_ctx->window_start_seq = ne->ack;
-        bpf_map_update_elem(&tcp_connections, &fid, tcp_ctx, BPF_ANY);
-    }
-    tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &fid);
-    if(!tcp_ctx) {
-        bpf_printk("\ntcp_ctx does not exist with the fid\n");
-        return;
-    }
-    bpf_printk("\nReceived ack %u, window_size: %u, start_seq: %u", ne->ack, tcp_ctx->current_size, tcp_ctx->window_start_seq);
+    deque(&fid);
+    // if(ne->ack > tcp_ctx->window_start_seq) {
+    //     tcp_ctx->current_size = tcp_ctx->current_size - (ne->ack - tcp_ctx->window_start_seq);
+    //     tcp_ctx->window_start_seq = ne->ack;
+    //     bpf_map_update_elem(&tcp_connections, &fid, tcp_ctx, BPF_ANY);
+    // }
+    // tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &fid);
+    // if(!tcp_ctx) {
+    //     bpf_printk("\ntcp_ctx does not exist with the fid\n");
+    //     return;
+    // }
+    // bpf_printk("\nReceived ack %u, window_size: %u, start_seq: %u", ne->ack, tcp_ctx->current_size, tcp_ctx->window_start_seq);
+
     // int num_to_send = tcp_ctx->window_start_seq + WINDOW_SIZE - tcp_ctx->last_seq_sent - 2;
     // bpf_printk("%d", num_to_send);
-    if(current_start > 100) {
-        current_start = 100;
-    }
-    int ack = ne->ack;
-    if(ack > 100) {
-        ack = 100;
-    }
-    int num_to_send = ne->ack - current_start;
-    if(num_to_send > 10) {
-        num_to_send = 10;
-    }
-    for(int i = current_start; i < ack; i++) {
-        struct packet_event pe;
-        __builtin_memset(&pe, 0, sizeof(pe));
-        pe.fid = fid;
-        pe.size =tcp_ctx->segment_size;
-        pe.seq_num = tcp_ctx->last_seq_sent + 1;
-        int ret = bpf_map_update_elem(&packet_events, &pe.seq_num, &pe, BPF_ANY);
-        if (ret < 0) {
-            bpf_printk("\nFailed to add packet with seq_num %u", 0);
-        }
-        tcp_ctx->current_size += 1;
-        tcp_ctx->last_seq_sent += 1;
-        bpf_map_update_elem(&tcp_connections, &(fid), tcp_ctx, BPF_ANY);
-        tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &fid);
-        if(!tcp_ctx) {
-            bpf_printk("\ntcp_ctx does not exist with the fid");
-            return;
-        }
-        bpf_printk("\nSend packet with seq_num: %u, window_size: %u, start_seq: %u", pe.seq_num, tcp_ctx->current_size, tcp_ctx->window_start_seq);
-    }
+    // for(int i = current_start; i < ack; i++) {
+    //     struct packet_event pe;
+    //     __builtin_memset(&pe, 0, sizeof(pe));
+    //     pe.fid = fid;
+    //     pe.size =tcp_ctx->segment_size;
+    //     pe.seq_num = tcp_ctx->last_seq_sent + 1;
+    //     int ret = bpf_map_update_elem(&packet_events, &pe.seq_num, &pe, BPF_ANY);
+    //     if (ret < 0) {
+    //         bpf_printk("\nFailed to add packet with seq_num %u", 0);
+    //     }
+    //     tcp_ctx->current_size += 1;
+    //     tcp_ctx->last_seq_sent += 1;
+    //     bpf_map_update_elem(&tcp_connections, &(fid), tcp_ctx, BPF_ANY);
+    //     tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &fid);
+    //     if(!tcp_ctx) {
+    //         bpf_printk("\ntcp_ctx does not exist with the fid");
+    //         return;
+    //     }
+    //     bpf_printk("\nSend packet with seq_num: %u, window_size: %u, start_seq: %u", pe.seq_num, tcp_ctx->current_size, tcp_ctx->window_start_seq);
+    // }
 }
 
 static __always_inline void dispatcher(struct event *event) {
@@ -188,6 +204,17 @@ static __always_inline void dispatcher(struct event *event) {
     }
 }
 
+static __always_inline int parse_ethhdr_new(struct hdr_cursor *nh, void *data_end, struct ethhdr **ethhdr)
+{
+	struct ethhdr *eth = nh->pos;
+	int hdrsize = sizeof(*eth);
+	if (nh->pos + hdrsize > data_end)
+		return -1;
+	nh->pos += hdrsize;
+	*ethhdr = eth;
+	return eth->h_proto; /* network-byte-order */
+}
+
 // Problems: 
 // 1. Failed to use inline packet parsing helpers
 SEC("xdp")
@@ -206,6 +233,7 @@ int simply_drop(struct xdp_md *ctx)
         .pos = data,
     };
     struct flow_id fid;
+    __builtin_memset(&fid, 0, sizeof(fid));
 
     // Parsing ETh Header
     parse_ethhdr_new(&nh, data_end, &eth);
@@ -273,6 +301,7 @@ int simply_drop(struct xdp_md *ctx)
         return XDP_DROP;
     }
     dispatcher(&e);
+    display(&fid);
     return XDP_DROP;
 }
 
