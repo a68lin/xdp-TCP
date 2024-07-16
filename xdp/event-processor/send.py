@@ -5,15 +5,14 @@ import sys
 import time
 
 # sudo apt-get install python3-scapy
-from scapy.all import IP, UDP, TCP, Ether, get_if_hwaddr, get_if_list, send, sendp, sr1, srp, srp1, Raw
+from scapy.all import *
 
 
 def get_if():
     ifs=get_if_list()
-    iface=None # "h1-eth0"
+    iface=None
     for i in get_if_list():
-        #if "enp130s0" in i:
-        if "enp130s0" in i:
+        if "enp1s0f1np1" in i:
             iface=i
             break
     if not iface:
@@ -22,37 +21,18 @@ def get_if():
     return iface
 
 def main():
-
-    if len(sys.argv)<4:
-        print('pass 2 arguments: <destination IP> <source port> "<message>"')
-        exit(1)
-
-    addr = socket.gethostbyname(sys.argv[1])
-    src_port = int(sys.argv[2])
-    #src_port = 1
-    message = sys.argv[3]
+    id = int(sys.argv[1])
+    ack = 0
+    if(id == 3):
+        ack = int(sys.argv[2])
+    message = '12345'
     iface = get_if()
-
-    print("sending on interface %s to %s" % (iface, str(addr)))
-    #while(src_port < 999):
-
-    # green04
-    #ether_info  = Ether(src=get_if_hwaddr(iface), dst='f4:52:14:26:8b:20')
-    #ether_info  = Ether(src=get_if_hwaddr(iface))
-    # green02
-    #ether_info  = Ether(src=get_if_hwaddr(iface), dst='f4:52:14:48:94:b0')
-    # aqua07
-    ether_info  = Ether(src=get_if_hwaddr(iface), dst='f4:52:14:48:92:30')
-    ip_info     = IP(dst=addr)
-    trans_info  = TCP(dport=230, sport=231, flags="SA", ack=1)
-    
+    print("sending on interface %s to %s" % (iface, "64:9d:99:ff:f0:53"))
+    ether_info  = Ether(src=get_if_hwaddr(iface), dst='64:9d:99:ff:f0:53')
+    ip_info     = IP(dst="192.168.42.221", id=id)
+    trans_info  = TCP(dport=1025, sport=1024, flags="SA", ack=ack)
     pkt = ether_info / ip_info / trans_info / message
-    #pkt = ip_info / trans_info
-
     pkt.show2()
-
-    #response = srp1(pkt, timeout=1)
-    #response = sr1(pkt, timeout=1)
     sendp(pkt, iface = iface)
 
         #src_port += 1

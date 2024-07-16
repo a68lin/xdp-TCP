@@ -5,7 +5,6 @@
 #include <linux/types.h>
 #include <stdbool.h>
 #include <xdp/libxdp.h>
-#include <netinet/in.h>
 
 struct config {
 	enum xdp_attach_mode attach_mode;

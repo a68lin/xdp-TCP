@@ -35,8 +35,9 @@ static const char *__doc__ = "XDP loader and stats program\n"
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
+#include "common.h"
 
-#define MAX_NUMBER_CORES 8
+#define MAX_NUMBER_CORES 1
 #define MAX_NUMBER_PKTS 100000000
 
 static const char *default_filename = "xdp_prog_kern.o";
@@ -45,12 +46,22 @@ static const char *default_progname = "simply_drop";
 
 int counter_percore[8];
 
-
 bool stop = false;
 
 struct config cfg = {
 		.ifindex   = -1,
 		.do_unload = false,
+};
+
+struct flow_id fid;
+
+struct tcp_md tcp_ctx = {
+	.segment_size = 1,
+	.window_size = 5,
+	.window_start_seq = 0,
+	.last_seq_sent = -1,
+	.cur_size = 0,
+	.head = 0,
 };
 
 struct Argument {
@@ -124,18 +135,26 @@ void create_ip_header(struct iphdr *ip_hdr) {
     ip_hdr->ihl = 5;
     ip_hdr->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr));  // Adjust if more data is added
     ip_hdr->protocol = IPPROTO_TCP;
-    ip_hdr->saddr = inet_addr("10.7.0.7");
-    ip_hdr->daddr = inet_addr("10.7.0.6");
+    ip_hdr->saddr = inet_addr("192.168.42.221");
+    ip_hdr->daddr = inet_addr("192.168.42.220");
+	ip_hdr->id = htons(1);
+
+	fid.sender_ip = inet_addr("192.168.42.221");
+	fid.receiver_ip = inet_addr("192.168.42.220");
 }
 
 void create_tcp_header(struct tcphdr *tcp_hdr) {
 	memset(tcp_hdr, 0, sizeof(struct tcphdr));
-	tcp_hdr->source = htonl(1);
-	tcp_hdr->dest = htonl(123);
-	//tcp_hdr->seq = htonl(0);
-	//tcp_hdr->ack_seq = htonl(0);
+	tcp_hdr->source = htons(1025);
+	tcp_hdr->dest = htons(1024);
+	tcp_hdr->doff = 5;
+	//tcp_hdr->ack_seq = htonl(10);
+
+	fid.sender_port = htons(1025);
+	fid.receiver_port = htons(1024);
 }
 
+char message[] = "12345";
 void create_packet(unsigned char *data/*, size_t *data_len*/) {
     struct ethhdr eth_hdr;
     struct iphdr ip_hdr;
@@ -152,80 +171,10 @@ void create_packet(unsigned char *data/*, size_t *data_len*/) {
     offset += sizeof(ip_hdr);
     memcpy(data + offset, &tcp_hdr, sizeof(tcp_hdr));
     offset += sizeof(tcp_hdr);
+    memcpy(data + offset, message, strlen(message));
+    offset += strlen(message);
 
     //*data_len = offset;
-}
-
-void print_counter_map(int map_fd) {
-	__u64 sum = 0;
-	__u64 value;
-	for(int key = 0; key < MAX_NUMBER_CORES; key++) {
-		bpf_map_lookup_elem(map_fd, &key, &value);
-		printf("Counter of CPU %d: %llu\n", key, value);
-		sum += value;
-	}
-	printf("Total: %llu\n\n", sum);
-}
-
-void *thread_exec(void *arg) {
-	//int teste = sched_getcpu();
-	//printf("\nCPU core running loader program: %d\n\n", teste);
-
-	struct Argument *info = (struct Argument *) arg;
-
-	union bpf_attr run_attr = {
-        .test = {
-            .prog_fd = info->prog_fd,
-            .retval = 0,  // Initialized to 0; will be set after execution
-            .data_size_in = info->data_len,
-            .data_size_out = info->data_len,  // Same as input if you're not expecting modification
-            .data_in = (unsigned long)info->data,
-            .data_out = (unsigned long)info->data,  // Can be the same as data_in
-            .repeat = 1,  // Run once unless you're benchmarking
-            .duration = 0,  // Will be set after execution
-        },
-    };
-
-	int cpu_id = info->cpu_id;
-
-	while(!stop) {
-		int ret = syscall(__NR_bpf, BPF_PROG_TEST_RUN, &run_attr, sizeof(run_attr));
-		if (ret < 0) {
-			fprintf(stderr, "BPF_PROG_TEST_RUN failed: %s\n", strerror(errno));
-			break;
-		}
-		counter_percore[cpu_id] += 1;
-	}
-	
-	free(info);
-	pthread_exit(NULL);
-}
-
-void print_queues(int outer_map_fd) {
-	__u32 value;
-	int inner_fd;
-	int inner_id;
-
-	for(int i = 0; i < MAX_NUMBER_CORES; i++) {
-		int last_value = -1;
-
-		bpf_map_lookup_elem(outer_map_fd, &i, &inner_id);
-		inner_fd = bpf_map_get_fd_by_id(inner_id);
-		value = -1;
-		printf("\n\nQueue of CPU %d: ", i);
-
-		for(int i = 0; i < 1248; i++) {
-			bpf_map_lookup_and_delete_elem(inner_fd, NULL, &value);
-			if(i > 0 && (last_value + 2 != value)) {
-				if(last_value != 8 && last_value != 9)
-					printf("**(** ");
-				else if((last_value == 8 || last_value == 9) && (value != 0 && value != 1))
-					printf("**)** ");
-			}
-			printf("%d ", value);
-			last_value = value;
-		}
-	}
 }
 
 static void exit_application(int signal)
@@ -302,68 +251,36 @@ int main(int argc, char **argv)
 	else
 		printf("File descriptor: %d\n\n", xdp_program__fd(program));
 
+	unsigned char data[1500];
+	size_t data_len = 1500;
 
-	unsigned char data[1500];  // Ensure the buffer is large enough
-    size_t data_len = 1499;
-    
-    create_packet(data/*, &data_len*/);
+	create_packet(data/*, &data_len*/);
+	LIBBPF_OPTS(bpf_test_run_opts, opts);
+	opts.data_in = data;
+	opts.data_out = data;
+	opts.data_size_in = data_len;
+	opts.data_size_out = data_len;
+	opts.flags = (1U << 1);
+	opts.repeat = 1;
 
-	int map_fd = find_map_fd(xdp_program__bpf_obj(program), "counter_array");
-	if (map_fd < 0) {
+	int map_fd = find_map_fd(xdp_program__bpf_obj(program), "tcp_connections");
+	bpf_map_update_elem(map_fd, &fid, &tcp_ctx, BPF_ANY);
+
+	int timer_map_fd = find_map_fd(xdp_program__bpf_obj(program), "timer_array");
+	if (timer_map_fd < 0) {
 		return EXIT_FAIL_BPF;
 	}
 
-	int outer_map_fd = find_map_fd(xdp_program__bpf_obj(program), "outer_map_queue");
-	if (outer_map_fd < 0) {
-		return EXIT_FAIL_BPF;
-	}
-
-
-	pthread_t threads[MAX_NUMBER_CORES];
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-
-	for(int i = 0; i < MAX_NUMBER_CORES; i++) {
-		struct Argument *arg = malloc(sizeof(struct Argument));
-		arg->prog_fd = prog_fd;
-		arg->data_len = data_len;
-		arg->data = data;
-		arg->cpu_id = i;
-		CPU_SET(i, &cpuset);
-		pthread_create(&threads[i], NULL, thread_exec, (void *) arg);
-		pthread_setaffinity_np(threads[i], sizeof(cpu_set_t), &cpuset);
-		CPU_ZERO(&cpuset);
-	}
-
-	long int sum;
-	while(!stop) {
-		print_counter_map(map_fd);
-		for(int i = 0; i < MAX_NUMBER_CORES; i++)
-			sum += counter_percore[i];
-		if(sum > MAX_NUMBER_PKTS) {
-			stop = true;
-			break;
+	while(true) {
+		err = xdp_program__test_run(program, &opts, 0);
+		if (err != 0) {
+			printf("[error]: bpf test run failed: %d\n", err);
 		}
-		sum = 0;
-		sleep(1);
+		char q;
+		int ret = scanf("%c", &q);
+		if(q == 'q')
+			break;
 	}
-
-	for(int i = 0; i < MAX_NUMBER_CORES; i++) {
-		pthread_join(threads[i], NULL);
-	}
-
-
-	sum = 0;
-	for(int i = 0; i < MAX_NUMBER_CORES; i++)
-		sum += counter_percore[i];
-
-	print_counter_map(map_fd);
-
-	printf("Total number of packets sent by userspace program: %ld\n\n", sum);
-
-	print_queues(outer_map_fd);
-
-	printf("\n\n");
 
     return 0;
 }

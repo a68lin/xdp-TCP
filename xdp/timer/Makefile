@@ -4,10 +4,6 @@
 XDP_TARGETS  := xdp_prog_kern
 USER_TARGETS := xdp_load_and_stats
 
-LLC ?= llc
-CLANG ?= clang
-CC := gcc
-
 COMMON_DIR = ../common
 
 COMMON_OBJS += $(COMMON_DIR)/common_user_bpf_xdp.o
