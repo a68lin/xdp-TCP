@@ -19,4 +19,4 @@ Things needed to modify:
 1. Now for each connection, only one timer and one timeout_event can be generated, which is the first entry (index = 0) in the timer_array and timeout_array. 
 2. Add flow_id to the map entry containing the timer.
 3. Now the program does not know when the data sent from the user-space is all sent, need to add condition check when sending new packet to see if all data is sent and asked. 
-4. The connection flow id is hardcoded and created in the user-space, need to modify the kernel program to insert new (flow_id, tcp_ctx) pair to the map if a packet arrives. 
+4. App_event window update (with 3). 
