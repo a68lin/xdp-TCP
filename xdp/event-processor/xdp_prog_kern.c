@@ -25,8 +25,6 @@ enum event_type {
 
 struct app_event {
     struct flow_id *fid;
-    void *data;
-    void *data_end;
     __u32 size;
 };
 
@@ -38,12 +36,12 @@ struct net_event {
 struct packet_event {
     struct flow_id *fid;
     int seq_num;
-    char data;
+    void  *data;
     __u32 size;
 };
 
 struct timeout_event {
-    //struct flow_id *fid;
+    struct flow_id *fid;
     int seq_num;
 };
 
@@ -69,21 +67,21 @@ struct
 } window_packets SEC(".maps");
 
 struct map_elem {
-    //struct flow_id fid;
+    struct flow_id *fid;
     int seq_num;
     struct bpf_timer timer;
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct flow_id);
     __type(value, struct map_elem);
     __uint(max_entries, WINDOW_SIZE);
 } timer_array SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct flow_id);
     __type(value, struct timeout_event);
     __uint(max_entries, 1000);
 } timeout_array SEC(".maps");
@@ -131,35 +129,47 @@ static __always_inline int deque(struct flow_id *fid) {
         bpf_printk("The remove packet does not exist");
         return 0;
     }
-    bpf_printk("packet acked: %u", pe->seq_num);
     tcp_ctx->head = (tcp_ctx->head + 1) % tcp_ctx->window_size;
     tcp_ctx->cur_size -= 1;
     bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
     return 1;
 }
 
-static __always_inline int timer_callback(void *map, __u32 *key, struct map_elem *val) {
-    struct map_elem *entry = bpf_map_lookup_elem(map, key);
-    if(!entry) {
-        bpf_printk("Couldn't get entry of the map");
-        return 0;
-    }
-    bpf_printk("Packet %d timeouts", entry->seq_num);
-    //struct event e;
-    //__builtin_memset(&e, 0, sizeof(e));
-    //e.type = TIMEOUT_EVENT;
-    //e.event_data = &te;
-    //te.fid = entry->fid;
+static __always_inline int timer_callback(void *map, struct flow_id *fid, struct map_elem *val) {
+    // struct map_elem *entry = bpf_map_lookup_elem(map, fid);
+    // if(!entry) {
+    //     bpf_printk("Couldn't get entry of the map");
+    //     return 0;
+    // }
+    bpf_printk("Packet %d timeouts", val->seq_num);
     struct timeout_event te;
     __builtin_memset(&te, 0, sizeof(te));
-    te.seq_num = entry->seq_num;
-    __u32 index = 0;
-    bpf_map_update_elem(&timeout_array, &index, &te, BPF_ANY);
-    int i = bpf_timer_start(&entry->timer, ONE_SEC, 0);
+    te.seq_num = val->seq_num;
+    te.fid = fid;
+    bpf_map_update_elem(&timeout_array, fid, &te, BPF_ANY);
+    int i = bpf_timer_start(&val->timer, ONE_SEC, 0);
     if (i != 0) {
         bpf_printk("Timer start failed");
         return 0;
     }
+    return 0;
+}
+
+static long app_event_send(__u32 index, struct flow_id *fid) {
+    struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, fid);
+    if(!tcp_ctx) {
+        bpf_printk("\ntcp_ctx does not exist with the fid\n");
+        return 0;
+    }
+    struct packet_event pe;
+    __builtin_memset(&pe, 0, sizeof(pe));
+    pe.fid = fid;
+    pe.size =tcp_ctx->segment_size;
+    pe.seq_num = tcp_ctx->last_seq_sent + 1;
+    pe.data = tcp_ctx->data + pe.seq_num  + 1;
+    enque(&pe, fid);
+    tcp_ctx->last_seq_sent += 1;
+    bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
     return 0;
 }
 
@@ -170,29 +180,29 @@ static __always_inline void app_event_processor(struct app_event* ae) {
         bpf_printk("\ntcp_ctx does not exist with the fid\n");
         return;
     }
-    for (int i = 0; i < WINDOW_SIZE; i++) {
-        struct packet_event pe;
-        __builtin_memset(&pe, 0, sizeof(pe));
-        pe.fid = ae->fid;
-        pe.size =tcp_ctx->segment_size;
-        pe.seq_num = tcp_ctx->last_seq_sent + 1;
-        enque(&pe, ae->fid);
-        tcp_ctx->last_seq_sent += 1;
-        bpf_map_update_elem(&tcp_connections, ae->fid, tcp_ctx, BPF_ANY);
-    }
-    int key = 0;
-    struct map_elem *map_entry = bpf_map_lookup_elem(&timer_array, &key);
+    int data_length = tcp_ctx->data_end - tcp_ctx->data;
+    int data_rest = data_length - (tcp_ctx->last_seq_sent + 1);
+    int num_to_send = data_rest < WINDOW_SIZE ? data_rest : WINDOW_SIZE;
+    //bpf_printk("length:%d, rest:%d, num_to_send:%d", data_length, data_rest, num_to_send);
+    bpf_loop(num_to_send, app_event_send, ae->fid, 0);
+
+    struct map_elem *map_entry = bpf_map_lookup_elem(&timer_array, ae->fid);
     if (!map_entry) {
-        bpf_printk("map_entry not found");
-        return;
+        bpf_printk("new timer added based on flow id");
+        struct map_elem me;
+        __builtin_memset(&me, 0, sizeof( me));
+        bpf_map_update_elem(&timer_array, ae->fid, &me, BPF_ANY);
+        map_entry = bpf_map_lookup_elem(&timer_array, ae->fid);
+        if(!map_entry) {
+            bpf_printk("new map_entry added failed");
+            return;
+        }
     }
     map_entry->seq_num = 0;
-    //map_entry->fid = ae->fid;
-    //bpf_map_update_elem(&timer_array, &key, map_entry, BPF_ANY);
+    map_entry->fid = ae->fid;
     long int i = bpf_timer_init(&(map_entry->timer), &timer_array, CLOCK_BOOTTIME);
     if(i != 0) {
-        bpf_printk("Error while initializing timer %d", i);
-        return;
+        bpf_printk("App_event recalled");
     }
     i = bpf_timer_set_callback(&map_entry->timer, timer_callback);
     if(i != 0) {
@@ -216,11 +226,15 @@ static long update_window(__u32 index, struct flow_id *fid) {
         return 0;
     }
     deque(fid);
+    if(tcp_ctx->data_end - tcp_ctx->data == tcp_ctx->last_seq_sent + 1) {
+        return 0;
+    }
     struct packet_event pe;
     __builtin_memset(&pe, 0, sizeof(pe));
     pe.fid = fid;
     pe.size =tcp_ctx->segment_size;
     pe.seq_num = tcp_ctx->last_seq_sent + 1;
+    pe.data = tcp_ctx->data + pe.seq_num  + 1;
     enque(&pe, fid);
     tcp_ctx->last_seq_sent += 1;
     bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
@@ -229,7 +243,6 @@ static long update_window(__u32 index, struct flow_id *fid) {
 
 static __always_inline void net_event_processor(struct net_event* ne) {
     // Get tcp_ctx and update
-    bpf_printk("Received ack: %u", ne->ack);
     struct tcp_md *tcp_ctx;
     __builtin_memset(&tcp_ctx, 0, sizeof(tcp_ctx));
     tcp_ctx = bpf_map_lookup_elem(&tcp_connections, ne->fid);
@@ -237,22 +250,34 @@ static __always_inline void net_event_processor(struct net_event* ne) {
         bpf_printk("\ntcp_ctx does not exist with the fid\n");
         return;
     }
+    struct map_elem *map_entry = bpf_map_lookup_elem(&timer_array, ne->fid);
+    if (!map_entry) {
+        bpf_printk("map_entry not found");
+        return;
+    }
+
     if(ne->ack <= tcp_ctx->window_start_seq) return;
+    bpf_printk("Received ack: %u", ne->ack);
+    int data_length = tcp_ctx->data_end - tcp_ctx->data;
+    int data_rest = data_length - (tcp_ctx->last_seq_sent + 1);
+    if(data_rest == 0 && ne->ack == tcp_ctx->last_seq_sent + 1) {
+        bpf_printk("All packets sent and received");
+        tcp_ctx->last_seq_sent = -1;
+        tcp_ctx->window_start_seq = 0,
+	    tcp_ctx->cur_size = 0,
+        tcp_ctx->head = 0,
+        bpf_timer_cancel(&map_entry->timer);
+        bpf_map_update_elem(&tcp_connections, ne->fid, tcp_ctx, BPF_ANY);
+        return;
+    }
+
     int num_to_send = ne->ack - tcp_ctx->window_start_seq;
     tcp_ctx->window_start_seq = ne->ack;
     bpf_map_update_elem(&tcp_connections, ne->fid, tcp_ctx, BPF_ANY);
     bpf_loop(num_to_send, update_window, ne->fid, 0);
 
     //Restart the timer using window_start_seq
-    int key = 0;
-    struct map_elem *map_entry = bpf_map_lookup_elem(&timer_array, &key);
-    if (!map_entry) {
-        bpf_printk("map_entry not found");
-        return;
-    }
     map_entry->seq_num = tcp_ctx->window_start_seq;
-    //map_entry->fid = ae->fid;
-    //bpf_map_update_elem(&timer_array, &key, map_entry, BPF_ANY);
     int i = bpf_timer_set_callback(&map_entry->timer, timer_callback);
     if(i != 0) {
         bpf_printk("Error while setting callback");
@@ -298,21 +323,20 @@ static __always_inline int parse_ethhdr_new(struct hdr_cursor *nh, void *data_en
 }
 
 static __always_inline void resend_packet(struct flow_id fid) {
-    __u32 key = 0;
-    struct timeout_event *te = bpf_map_lookup_elem(&timeout_array, &key);
+    struct timeout_event *te = bpf_map_lookup_elem(&timeout_array, &fid);
     if(!te) {
-        bpf_printk("\nevent not found");
+        bpf_printk("There is not packet needed to be resent");
         return;
     }
     struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &fid);
     if(!tcp_ctx) {
-        bpf_printk("\ntcp_ctx does not exist with the fid");
+        bpf_printk("tcp_ctx does not exist with the fid");
         return;
     }
     if(tcp_ctx->window_start_seq == te->seq_num) {
         struct packet_event *pe = bpf_map_lookup_elem(&window_packets, &tcp_ctx->head);
         if(!pe) {
-            bpf_printk("\nResent packet not found");
+            bpf_printk("Resent packet not found");
             return;
         }
         send_packet(pe);
@@ -325,8 +349,6 @@ int simply_drop(struct xdp_md *ctx)
     // Get packet and packet length
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
-
-    bpf_printk("test");
 
     // Parsing begins
     struct ethhdr *eth;
@@ -346,22 +368,19 @@ int simply_drop(struct xdp_md *ctx)
     struct iphdr *iph = nh.pos;
 	int hdrsize;
 	if (iph + 1 > data_end) {
-        bpf_printk("\n1");
 		return -1;
     }
 	hdrsize = iph->ihl * 4;
 	if(hdrsize < sizeof(*iph)) {
-        bpf_printk("\n1");
 		return -1;
     }
 	if (nh.pos + hdrsize > data_end) {
-        bpf_printk("\n1");
 		return -1;
     }
 	nh.pos += hdrsize;
 	iphdr = iph;
     __u16 id = bpf_ntohs(iphdr->id);
-    bpf_printk("\nID: %u", id); 
+    bpf_printk("ID: %u", id); 
     fid.sender_ip = iphdr->saddr;
     fid.receiver_ip = iphdr->daddr;
     //bpf_printk("\nIP: %u, %u", fid.sender_ip, fid.receiver_ip); 
@@ -370,7 +389,6 @@ int simply_drop(struct xdp_md *ctx)
     int len;
 	struct tcphdr *h = nh.pos;
 	if (h + 1 > data_end) {
-        bpf_printk("\n1");
 		return -1;
     }
 	len = h->doff * 4;
@@ -402,6 +420,19 @@ int simply_drop(struct xdp_md *ctx)
     reverse_fid.receiver_ip = fid.sender_ip;
     reverse_fid.receiver_port = fid.sender_port;
 
+    // Update data_end
+    if (id == 2) {
+        struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, &reverse_fid);
+        if(!tcp_ctx) {
+            bpf_printk("tcp_ctx does not exist with the fid");
+            return XDP_DROP;
+        }
+        tcp_ctx->data = nh.pos;
+        tcp_ctx->data_end = data_end;
+        bpf_printk("length:%u", tcp_ctx->data_end - tcp_ctx->data);
+        bpf_map_update_elem(&tcp_connections, &reverse_fid, tcp_ctx, BPF_ANY);
+    }
+
     if (id == 3) {
         e.type = NET_EVENT;
         e.event_data = &ne;
@@ -413,8 +444,6 @@ int simply_drop(struct xdp_md *ctx)
         e.type = APP_EVENT;
         e.event_data = &ae;
         ae.fid = &reverse_fid;
-        ae.data = nh.pos;
-        ae.data_end = data_end;
         ae.size = data_end - nh.pos;
         dispatcher(&e);
     }

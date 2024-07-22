@@ -14,7 +14,7 @@ struct tcp_md {
     __u32 window_size;
     // The sequence number of the first packet in the window
     __u32 window_start_seq;
-    // THe last sequence number sent
+    // The last sequence number sent
     __u32 last_seq_sent;
 
     // Circular queue(the actual window stores sent packets): 
@@ -22,4 +22,8 @@ struct tcp_md {
     __u32 head;
     // The current size of the circular queue
     __u32 cur_size;
+
+    // The data and its end
+    void *data;
+    void *data_end;
 };

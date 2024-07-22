@@ -25,7 +25,10 @@ def main():
     ack = 0
     if(id == 3):
         ack = int(sys.argv[2])
-    message = '12345'
+    if(id == 2):
+        message = sys.argv[2]
+    else:
+        message = ''
     iface = get_if()
     print("sending on interface %s to %s" % (iface, "64:9d:99:ff:f0:53"))
     ether_info  = Ether(src=get_if_hwaddr(iface), dst='64:9d:99:ff:f0:53')

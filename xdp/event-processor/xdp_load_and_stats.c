@@ -62,6 +62,8 @@ struct tcp_md tcp_ctx = {
 	.last_seq_sent = -1,
 	.cur_size = 0,
 	.head = 0,
+	.data = NULL,
+	.data_end = NULL,
 };
 
 struct Argument {
