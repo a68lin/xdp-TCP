@@ -16,7 +16,4 @@ Example execution order:
 5. In c, you can try sending different acks. 
 
 Things needed to modify:
-1. Now for each connection, only one timer and one timeout_event can be generated, which is the first entry (index = 0) in the timer_array and timeout_array. 
-2. Add flow_id to the map entry containing the timer.
-3. Now the program does not know when the data sent from the user-space is all sent, need to add condition check when sending new packet to see if all data is sent and asked. 
-4. App_event window update (with 3). 
+1.Now the program cam terminate, but can only process one app_event at a time, if sending another app_event while sending the previous packets, it will fail. But if an app_event is all sent, sending another one will work. 
