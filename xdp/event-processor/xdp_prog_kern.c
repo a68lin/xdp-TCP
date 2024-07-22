@@ -36,7 +36,6 @@ struct net_event {
 struct packet_event {
     struct flow_id *fid;
     int seq_num;
-    void  *data;
     __u32 size;
 };
 
@@ -136,11 +135,6 @@ static __always_inline int deque(struct flow_id *fid) {
 }
 
 static __always_inline int timer_callback(void *map, struct flow_id *fid, struct map_elem *val) {
-    // struct map_elem *entry = bpf_map_lookup_elem(map, fid);
-    // if(!entry) {
-    //     bpf_printk("Couldn't get entry of the map");
-    //     return 0;
-    // }
     bpf_printk("Packet %d timeouts", val->seq_num);
     struct timeout_event te;
     __builtin_memset(&te, 0, sizeof(te));
@@ -166,7 +160,6 @@ static long app_event_send(__u32 index, struct flow_id *fid) {
     pe.fid = fid;
     pe.size =tcp_ctx->segment_size;
     pe.seq_num = tcp_ctx->last_seq_sent + 1;
-    pe.data = tcp_ctx->data + pe.seq_num  + 1;
     enque(&pe, fid);
     tcp_ctx->last_seq_sent += 1;
     bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
@@ -180,8 +173,7 @@ static __always_inline void app_event_processor(struct app_event* ae) {
         bpf_printk("\ntcp_ctx does not exist with the fid\n");
         return;
     }
-    int data_length = tcp_ctx->data_end - tcp_ctx->data;
-    int data_rest = data_length - (tcp_ctx->last_seq_sent + 1);
+    int data_rest = tcp_ctx->data_size - (tcp_ctx->last_seq_sent + 1);
     int num_to_send = data_rest < WINDOW_SIZE ? data_rest : WINDOW_SIZE;
     //bpf_printk("length:%d, rest:%d, num_to_send:%d", data_length, data_rest, num_to_send);
     bpf_loop(num_to_send, app_event_send, ae->fid, 0);
@@ -226,7 +218,7 @@ static long update_window(__u32 index, struct flow_id *fid) {
         return 0;
     }
     deque(fid);
-    if(tcp_ctx->data_end - tcp_ctx->data == tcp_ctx->last_seq_sent + 1) {
+    if(tcp_ctx->data_size == tcp_ctx->last_seq_sent + 1) {
         return 0;
     }
     struct packet_event pe;
@@ -234,7 +226,6 @@ static long update_window(__u32 index, struct flow_id *fid) {
     pe.fid = fid;
     pe.size =tcp_ctx->segment_size;
     pe.seq_num = tcp_ctx->last_seq_sent + 1;
-    pe.data = tcp_ctx->data + pe.seq_num  + 1;
     enque(&pe, fid);
     tcp_ctx->last_seq_sent += 1;
     bpf_map_update_elem(&tcp_connections, fid, tcp_ctx, BPF_ANY);
@@ -258,16 +249,10 @@ static __always_inline void net_event_processor(struct net_event* ne) {
 
     if(ne->ack <= tcp_ctx->window_start_seq) return;
     bpf_printk("Received ack: %u", ne->ack);
-    int data_length = tcp_ctx->data_end - tcp_ctx->data;
-    int data_rest = data_length - (tcp_ctx->last_seq_sent + 1);
+    int data_rest = tcp_ctx->data_size - (tcp_ctx->last_seq_sent + 1);
     if(data_rest == 0 && ne->ack == tcp_ctx->last_seq_sent + 1) {
         bpf_printk("All packets sent and received");
-        tcp_ctx->last_seq_sent = -1;
-        tcp_ctx->window_start_seq = 0,
-	    tcp_ctx->cur_size = 0,
-        tcp_ctx->head = 0,
         bpf_timer_cancel(&map_entry->timer);
-        bpf_map_update_elem(&tcp_connections, ne->fid, tcp_ctx, BPF_ANY);
         return;
     }
 
@@ -349,7 +334,8 @@ int simply_drop(struct xdp_md *ctx)
     // Get packet and packet length
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
-
+    int cpu = bpf_get_smp_processor_id();
+    bpf_printk("%d", cpu);
     // Parsing begins
     struct ethhdr *eth;
     struct iphdr *iphdr;
@@ -427,9 +413,8 @@ int simply_drop(struct xdp_md *ctx)
             bpf_printk("tcp_ctx does not exist with the fid");
             return XDP_DROP;
         }
-        tcp_ctx->data = nh.pos;
-        tcp_ctx->data_end = data_end;
-        bpf_printk("length:%u", tcp_ctx->data_end - tcp_ctx->data);
+        tcp_ctx->data_size += data_end - nh.pos;
+        bpf_printk("New added:%u, cur_length:%u", data_end - nh.pos, tcp_ctx->data_size);
         bpf_map_update_elem(&tcp_connections, &reverse_fid, tcp_ctx, BPF_ANY);
     }
 
@@ -444,7 +429,6 @@ int simply_drop(struct xdp_md *ctx)
         e.type = APP_EVENT;
         e.event_data = &ae;
         ae.fid = &reverse_fid;
-        ae.size = data_end - nh.pos;
         dispatcher(&e);
     }
     else if (id == 1) {
@@ -456,22 +440,3 @@ int simply_drop(struct xdp_md *ctx)
 }
 
 char _license[] SEC("license") = "GPL";
-
-// static __always_inline void display(struct flow_id *fid) {
-//     struct tcp_md *tcp_ctx = bpf_map_lookup_elem(&tcp_connections, fid);
-//     if(!tcp_ctx) {
-//         bpf_printk("\ntcp_ctx does not exist with the fid");
-//         return;
-//     }
-//     bpf_printk("\nPackets in the window:");
-//     for(int i = 0; i < WINDOW_SIZE; i++) {
-//         if(i + 1 > tcp_ctx->cur_size) return;
-//         __u32 key = (tcp_ctx->head + i) % tcp_ctx->window_size;
-//         struct packet_event *pe = bpf_map_lookup_elem(&window_packets, &key);
-//         if(!pe) {
-//             bpf_printk("The packet does not exist");
-//             return;
-//         }
-//         bpf_printk("Seq num: %u", pe->seq_num);
-//     }
-// }

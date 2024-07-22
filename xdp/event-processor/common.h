@@ -24,6 +24,5 @@ struct tcp_md {
     __u32 cur_size;
 
     // The data and its end
-    void *data;
-    void *data_end;
+    __u32 data_size;
 };
